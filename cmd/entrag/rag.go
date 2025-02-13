@@ -123,13 +123,13 @@ Information:
 %v
 
 Question: %v`, b.String(), question)
-
 	oac := openai.NewClient(ctx.OpenAIKey)
 	resp, err := oac.CreateChatCompletion(
 		context.Background(),
 		openai.ChatCompletionRequest{
 			Model: openai.GPT4o,
 			Messages: []openai.ChatCompletionMessage{
+
 				{
 					Role:    openai.ChatMessageRoleUser,
 					Content: query,
@@ -152,6 +152,8 @@ func (c *CLI) entClient() (*ent.Client, error) {
 
 // breakToChunks reads the file in `path` and breaks it into chunks of
 // approximately chunkSize tokens each, returning the chunks.
+// This method  as well as `splitByParagraph` and `getEmbedding` were taken almost verbatim from Eli
+// Bendersky's great blog post on RAGs with Go: https://eli.thegreenplace.net/2023/retrieval-augmented-generation-in-go
 func breakToChunks(path string) []string {
 	f, err := os.Open(path)
 	if err != nil {
@@ -203,12 +205,10 @@ func splitByParagraph(data []byte, atEOF bool) (advance int, token []byte, err e
 // for the given string. It returns the embedding.
 func getEmbedding(data string) []float32 {
 	client := openai.NewClient(os.Getenv("OPENAI_KEY"))
-
 	queryReq := openai.EmbeddingRequest{
 		Input: []string{data},
 		Model: openai.AdaEmbeddingV2,
 	}
-
 	queryResponse, err := client.CreateEmbeddings(context.Background(), queryReq)
 	if err != nil {
 		log.Fatalf("Error getting embedding: %v", err)
