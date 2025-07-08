@@ -14,14 +14,14 @@ database:
 ollama:
   url: "http://localhost:11434"
   embed_model: "nomic-embed-text"
-  chat_model: "llama3.1"
+  chat_model: "llama3.2:3b"  # 使用更小的3B模型，速度更快
 
 # Application Configuration
 app:
   chunk_size: 1000
   token_encoding: "cl100k_base"
   embedding_dimensions: 768
-  max_similar_chunks: 5
+  max_similar_chunks: 3  # 减少上下文长度
 
 # Logging Configuration
 logging:

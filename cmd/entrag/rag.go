@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"entgo.io/ent/dialect/sql"
 	"github.com/charmbracelet/glamour"
@@ -127,16 +128,31 @@ func (cmd *IndexCmd) Run(cli *CLI) error {
 
 // Run is the method called when the "ask" command is executed.
 func (cmd *AskCmd) Run(ctx *CLI) error {
+	// 记录总开始时间
+	totalStart := time.Now()
+
 	cfg := ctx.LoadedConfig()
 	client, err := ctx.entClient()
 	if err != nil {
 		return fmt.Errorf("failed opening connection to postgres: %w", err)
 	}
+
 	question := cmd.Text
+	fmt.Printf("🔍 处理问题: %s\n\n", question)
+
+	// 1. 获取问题的向量表示
+	fmt.Print("⏳ 正在生成问题向量...")
+	embeddingStart := time.Now()
 	emb, err := getEmbedding(question, cfg.Ollama.URL, cfg.Ollama.EmbedModel)
 	if err != nil {
 		return fmt.Errorf("error getting embedding: %v", err)
 	}
+	embeddingTime := time.Since(embeddingStart)
+	fmt.Printf(" 完成 (⏱️ %v)\n", embeddingTime)
+
+	// 2. 向量搜索相似文档
+	fmt.Print("⏳ 正在搜索相关文档...")
+	searchStart := time.Now()
 	embVec := pgvector.NewVector(emb)
 	embs := client.Embedding.
 		Query().
@@ -146,6 +162,12 @@ func (cmd *AskCmd) Run(ctx *CLI) error {
 		WithChunk().
 		Limit(cfg.App.MaxSimilarChunks).
 		AllX(context.Background())
+	searchTime := time.Since(searchStart)
+	fmt.Printf(" 完成 (⏱️ %v, 找到 %d 个相关片段)\n", searchTime, len(embs))
+
+	// 3. 构建上下文
+	fmt.Print("⏳ 正在构建上下文...")
+	contextStart := time.Now()
 	b := strings.Builder{}
 	for _, e := range embs {
 		chnk := e.Edges.Chunk
@@ -157,17 +179,46 @@ Information:
 %v
 
 Question: %v`, b.String(), question)
+	contextTime := time.Since(contextStart)
+	fmt.Printf(" 完成 (⏱️ %v)\n", contextTime)
 
+	// 4. 生成回答
+	fmt.Print("⏳ 正在生成回答...")
+	generationStart := time.Now()
 	answer, err := getChatCompletion(query, cfg.Ollama.URL, cfg.Ollama.ChatModel)
 	if err != nil {
 		return fmt.Errorf("error creating chat completion: %v", err)
 	}
+	generationTime := time.Since(generationStart)
+	fmt.Printf(" 完成 (⏱️ %v)\n", generationTime)
 
+	// 5. 渲染输出
+	fmt.Print("⏳ 正在渲染结果...")
+	renderStart := time.Now()
 	out, err := glamour.Render(answer, "dark")
 	if err != nil {
 		return fmt.Errorf("error rendering markdown: %v", err)
 	}
+	renderTime := time.Since(renderStart)
+	fmt.Printf(" 完成 (⏱️ %v)\n\n", renderTime)
+
+	// 计算总时间
+	totalTime := time.Since(totalStart)
+
+	// 输出时间统计
+	fmt.Println("📊 执行时间统计:")
+	fmt.Printf("   问题向量化: %8v (%.1f%%)\n", embeddingTime, float64(embeddingTime)/float64(totalTime)*100)
+	fmt.Printf("   向量搜索:   %8v (%.1f%%)\n", searchTime, float64(searchTime)/float64(totalTime)*100)
+	fmt.Printf("   上下文构建: %8v (%.1f%%)\n", contextTime, float64(contextTime)/float64(totalTime)*100)
+	fmt.Printf("   回答生成:   %8v (%.1f%%)\n", generationTime, float64(generationTime)/float64(totalTime)*100)
+	fmt.Printf("   结果渲染:   %8v (%.1f%%)\n", renderTime, float64(renderTime)/float64(totalTime)*100)
+	fmt.Printf("   ─────────────────────────────\n")
+	fmt.Printf("   总计时间:   %8v (100.0%%)\n\n", totalTime)
+
+	// 输出回答
+	fmt.Println("💬 回答:")
 	fmt.Print(out)
+
 	return nil
 }
 
@@ -262,6 +313,11 @@ func getEmbedding(data string, ollamaURL string, model string) ([]float32, error
 
 // getChatCompletion invokes the Ollama chat API to generate a response
 func getChatCompletion(prompt string, ollamaURL string, model string) (string, error) {
+	// 记录请求的详细信息
+	promptLen := len(prompt)
+	fmt.Printf("   📝 上下文长度: %d 字符\n", promptLen)
+	fmt.Printf("   🤖 使用模型: %s\n", model)
+
 	reqBody := OllamaChatRequest{
 		Model:  model,
 		Prompt: prompt,
@@ -273,21 +329,32 @@ func getChatCompletion(prompt string, ollamaURL string, model string) (string, e
 		return "", fmt.Errorf("error marshaling request: %v", err)
 	}
 
+	// 记录网络请求时间
+	networkStart := time.Now()
 	resp, err := http.Post(ollamaURL+"/api/generate", "application/json", bytes.NewBuffer(jsonData))
 	if err != nil {
 		return "", fmt.Errorf("error making request: %v", err)
 	}
 	defer resp.Body.Close()
+	networkTime := time.Since(networkStart)
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
 		return "", fmt.Errorf("API error: %s", string(body))
 	}
 
+	// 记录响应解析时间
+	parseStart := time.Now()
 	var chatResp OllamaChatResponse
 	if err := json.NewDecoder(resp.Body).Decode(&chatResp); err != nil {
 		return "", fmt.Errorf("error decoding response: %v", err)
 	}
+	parseTime := time.Since(parseStart)
+
+	// 输出详细的性能信息
+	fmt.Printf("   📊 网络请求时间: %v\n", networkTime)
+	fmt.Printf("   📊 响应解析时间: %v\n", parseTime)
+	fmt.Printf("   📊 响应长度: %d 字符\n", len(chatResp.Response))
 
 	return chatResp.Response, nil
 }
