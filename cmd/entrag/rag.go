@@ -4,27 +4,52 @@ import (
 	"bufio"
 	"bytes"
 	"context"
-	"entgo.io/ent/dialect/sql"
+	"encoding/json"
 	"fmt"
+	"io"
+	"io/fs"
+	"log"
+	"net/http"
+	"os"
+	"path/filepath"
+	"strings"
+
+	"entgo.io/ent/dialect/sql"
 	"github.com/charmbracelet/glamour"
 	"github.com/pgvector/pgvector-go"
 	"github.com/pkoukk/tiktoken-go"
 	"github.com/rotemtam/entrag/ent"
 	"github.com/rotemtam/entrag/ent/chunk"
-	"github.com/sashabaranov/go-openai"
-	"io/fs"
-	"log"
-	"os"
-	"path/filepath"
-	"strings"
 
 	_ "github.com/lib/pq"
 )
 
-const (
-	tokenEncoding = "cl100k_base"
-	chunkSize     = 1000
+// These constants can be overridden by config
+var (
+	defaultTokenEncoding = "cl100k_base"
+	defaultChunkSize     = 1000
 )
+
+// Ollama API structures
+type OllamaEmbedRequest struct {
+	Model  string `json:"model"`
+	Prompt string `json:"prompt"`
+}
+
+type OllamaEmbedResponse struct {
+	Embedding []float32 `json:"embedding"`
+}
+
+type OllamaChatRequest struct {
+	Model  string `json:"model"`
+	Prompt string `json:"prompt"`
+	Stream bool   `json:"stream"`
+}
+
+type OllamaChatResponse struct {
+	Response string `json:"response"`
+	Done     bool   `json:"done"`
+}
 
 type (
 	// LoadCmd loads the markdown files into the database.
@@ -43,15 +68,16 @@ type (
 
 // Run is the method called when the "load" command is executed.
 func (cmd *LoadCmd) Run(ctx *CLI) error {
+	cfg := ctx.LoadedConfig()
 	client, err := ctx.entClient()
 	if err != nil {
 		return fmt.Errorf("failed opening connection to postgres: %w", err)
 	}
 	tokTotal := 0
 	return filepath.WalkDir(ctx.Load.Path, func(path string, d fs.DirEntry, err error) error {
-		if filepath.Ext(path) == ".mdx" || filepath.Ext(path) == ".md" {
+		if filepath.Ext(path) == ".mdx" || filepath.Ext(path) == ".md" || filepath.Ext(path) == ".txt" {
 			log.Printf("Chunking %v", path)
-			chunks := breakToChunks(path)
+			chunks := breakToChunks(path, cfg.App.ChunkSize, cfg.App.TokenEncoding)
 
 			for i, chunk := range chunks {
 				tokTotal += len(chunk)
@@ -68,6 +94,7 @@ func (cmd *LoadCmd) Run(ctx *CLI) error {
 
 // Run is the method called when the "index" command is executed.
 func (cmd *IndexCmd) Run(cli *CLI) error {
+	cfg := cli.LoadedConfig()
 	client, err := cli.entClient()
 	if err != nil {
 		return fmt.Errorf("failed opening connection to postgres: %w", err)
@@ -83,8 +110,11 @@ func (cmd *IndexCmd) Run(cli *CLI) error {
 		AllX(ctx)
 	for _, ch := range chunks {
 		log.Println("Created embedding for chunk", ch.Path, ch.Nchunk)
-		embedding := getEmbedding(ch.Data)
-		_, err := client.Embedding.Create().
+		embedding, err := getEmbedding(ch.Data, cfg.Ollama.URL, cfg.Ollama.EmbedModel)
+		if err != nil {
+			return fmt.Errorf("error getting embedding: %v", err)
+		}
+		_, err = client.Embedding.Create().
 			SetEmbedding(pgvector.NewVector(embedding)).
 			SetChunk(ch).
 			Save(ctx)
@@ -97,12 +127,16 @@ func (cmd *IndexCmd) Run(cli *CLI) error {
 
 // Run is the method called when the "ask" command is executed.
 func (cmd *AskCmd) Run(ctx *CLI) error {
+	cfg := ctx.LoadedConfig()
 	client, err := ctx.entClient()
 	if err != nil {
 		return fmt.Errorf("failed opening connection to postgres: %w", err)
 	}
 	question := cmd.Text
-	emb := getEmbedding(question)
+	emb, err := getEmbedding(question, cfg.Ollama.URL, cfg.Ollama.EmbedModel)
+	if err != nil {
+		return fmt.Errorf("error getting embedding: %v", err)
+	}
 	embVec := pgvector.NewVector(emb)
 	embs := client.Embedding.
 		Query().
@@ -110,7 +144,7 @@ func (cmd *AskCmd) Run(ctx *CLI) error {
 			s.OrderExpr(sql.ExprP("embedding <-> $1", embVec))
 		}).
 		WithChunk().
-		Limit(5).
+		Limit(cfg.App.MaxSimilarChunks).
 		AllX(context.Background())
 	b := strings.Builder{}
 	for _, e := range embs {
@@ -123,42 +157,35 @@ Information:
 %v
 
 Question: %v`, b.String(), question)
-	oac := openai.NewClient(ctx.OpenAIKey)
-	resp, err := oac.CreateChatCompletion(
-		context.Background(),
-		openai.ChatCompletionRequest{
-			Model: openai.GPT4o,
-			Messages: []openai.ChatCompletionMessage{
 
-				{
-					Role:    openai.ChatMessageRoleUser,
-					Content: query,
-				},
-			},
-		},
-	)
+	answer, err := getChatCompletion(query, cfg.Ollama.URL, cfg.Ollama.ChatModel)
 	if err != nil {
 		return fmt.Errorf("error creating chat completion: %v", err)
 	}
-	choice := resp.Choices[0]
-	out, err := glamour.Render(choice.Message.Content, "dark")
+
+	out, err := glamour.Render(answer, "dark")
+	if err != nil {
+		return fmt.Errorf("error rendering markdown: %v", err)
+	}
 	fmt.Print(out)
 	return nil
 }
 
 func (c *CLI) entClient() (*ent.Client, error) {
-	return ent.Open("postgres", c.DBURL)
+	cfg := c.LoadedConfig()
+	return ent.Open("postgres", cfg.Database.URL)
 }
 
 // breakToChunks reads the file in `path` and breaks it into chunks of
 // approximately chunkSize tokens each, returning the chunks.
 // This method  as well as `splitByParagraph` and `getEmbedding` were taken almost verbatim from Eli
 // Bendersky's great blog post on RAGs with Go: https://eli.thegreenplace.net/2023/retrieval-augmented-generation-in-go
-func breakToChunks(path string) []string {
+func breakToChunks(path string, chunkSize int, tokenEncoding string) []string {
 	f, err := os.Open(path)
 	if err != nil {
 		log.Fatalf("Error opening file: %v", err)
 	}
+	defer f.Close()
 
 	tke, err := tiktoken.GetEncoding(tokenEncoding)
 	if err != nil {
@@ -201,17 +228,66 @@ func splitByParagraph(data []byte, atEOF bool) (advance int, token []byte, err e
 	return 0, nil, nil
 }
 
-// getEmbedding invokes the OpenAI embedding API to calculate the embedding
+// getEmbedding invokes the Ollama embedding API to calculate the embedding
 // for the given string. It returns the embedding.
-func getEmbedding(data string) []float32 {
-	client := openai.NewClient(os.Getenv("OPENAI_KEY"))
-	queryReq := openai.EmbeddingRequest{
-		Input: []string{data},
-		Model: openai.AdaEmbeddingV2,
+func getEmbedding(data string, ollamaURL string, model string) ([]float32, error) {
+	reqBody := OllamaEmbedRequest{
+		Model:  model,
+		Prompt: data,
 	}
-	queryResponse, err := client.CreateEmbeddings(context.Background(), queryReq)
+
+	jsonData, err := json.Marshal(reqBody)
 	if err != nil {
-		log.Fatalf("Error getting embedding: %v", err)
+		return nil, fmt.Errorf("error marshaling request: %v", err)
 	}
-	return queryResponse.Data[0].Embedding
+
+	resp, err := http.Post(ollamaURL+"/api/embeddings", "application/json", bytes.NewBuffer(jsonData))
+	if err != nil {
+		return nil, fmt.Errorf("error making request: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("API error: %s", string(body))
+	}
+
+	var embedResp OllamaEmbedResponse
+	if err := json.NewDecoder(resp.Body).Decode(&embedResp); err != nil {
+		return nil, fmt.Errorf("error decoding response: %v", err)
+	}
+
+	return embedResp.Embedding, nil
+}
+
+// getChatCompletion invokes the Ollama chat API to generate a response
+func getChatCompletion(prompt string, ollamaURL string, model string) (string, error) {
+	reqBody := OllamaChatRequest{
+		Model:  model,
+		Prompt: prompt,
+		Stream: false,
+	}
+
+	jsonData, err := json.Marshal(reqBody)
+	if err != nil {
+		return "", fmt.Errorf("error marshaling request: %v", err)
+	}
+
+	resp, err := http.Post(ollamaURL+"/api/generate", "application/json", bytes.NewBuffer(jsonData))
+	if err != nil {
+		return "", fmt.Errorf("error making request: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return "", fmt.Errorf("API error: %s", string(body))
+	}
+
+	var chatResp OllamaChatResponse
+	if err := json.NewDecoder(resp.Body).Decode(&chatResp); err != nil {
+		return "", fmt.Errorf("error decoding response: %v", err)
+	}
+
+	return chatResp.Response, nil
 }

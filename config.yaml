@@ -1,0 +1,29 @@
+# Entrag RAG System Configuration
+
+# Database Configuration
+database:
+  url: "postgres://postgres:password@localhost:15432/entrag?sslmode=disable"
+  host: "localhost"
+  port: 15432
+  user: "postgres"
+  password: "password"
+  database: "entrag"
+  sslmode: "disable"
+
+# Ollama Configuration
+ollama:
+  url: "http://localhost:11434"
+  embed_model: "nomic-embed-text"
+  chat_model: "llama3.1"
+
+# Application Configuration
+app:
+  chunk_size: 1000
+  token_encoding: "cl100k_base"
+  embedding_dimensions: 768
+  max_similar_chunks: 5
+
+# Logging Configuration
+logging:
+  level: "info"
+  format: "text" 
