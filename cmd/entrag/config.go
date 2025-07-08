@@ -40,6 +40,8 @@ type AppConfig struct {
 	TokenEncoding       string `yaml:"token_encoding"`
 	EmbeddingDimensions int    `yaml:"embedding_dimensions"`
 	MaxSimilarChunks    int    `yaml:"max_similar_chunks"`
+	ChunkOverlap        int    `yaml:"chunk_overlap"`
+	MinChunkSize        int    `yaml:"min_chunk_size"`
 }
 
 // LoggingConfig represents logging configuration

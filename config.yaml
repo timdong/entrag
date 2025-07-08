@@ -1,4 +1,4 @@
-# Entrag RAG System Configuration
+# Entrag RAG System Configuration - Optimized Version
 
 # Database Configuration
 database:
@@ -14,14 +14,16 @@ database:
 ollama:
   url: "http://localhost:11434"
   embed_model: "nomic-embed-text"
-  chat_model: "llama3.2:3b"  # 使用更小的3B模型，速度更快
+  chat_model: "llama3.2:3b"  # 更快的3B模型
 
-# Application Configuration
+# Application Configuration - Performance Optimized
 app:
-  chunk_size: 1000
+  chunk_size: 600          # 优化：减小chunk以提高精度
   token_encoding: "cl100k_base"
   embedding_dimensions: 768
-  max_similar_chunks: 3  # 减少上下文长度
+  max_similar_chunks: 4    # 优化：平衡质量和速度
+  chunk_overlap: 80        # 优化：适度重叠
+  min_chunk_size: 120      # 优化：避免过小chunk
 
 # Logging Configuration
 logging:

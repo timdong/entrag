@@ -14,9 +14,12 @@ type CLI struct {
 	Config string `kong:"help='Path to configuration file.',default='config.yaml'"`
 
 	// Subcommands
-	Load  *LoadCmd  `kong:"cmd,help='Load command that accepts a path.'"`
-	Index *IndexCmd `kong:"cmd,help='Create embeddings for any chunks that do not have one.'"`
-	Ask   *AskCmd   `kong:"cmd,help='Ask a question about the indexed documents'"`
+	Load     *LoadCmd     `kong:"cmd,help='Load command that accepts a path.'"`
+	Index    *IndexCmd    `kong:"cmd,help='Create embeddings for any chunks that do not have one.'"`
+	Ask      *AskCmd      `kong:"cmd,help='Ask a question about the indexed documents'"`
+	Stats    *StatsCmd    `kong:"cmd,help='Show statistics about chunks and embeddings'"`
+	Cleanup  *CleanupCmd  `kong:"cmd,help='Remove orphaned chunks and optimize the database'"`
+	Optimize *OptimizeCmd `kong:"cmd,help='Optimize system performance and warm up caches'"`
 
 	// Internal config (loaded from file)
 	cfg *Config `kong:"-"`

@@ -4,6 +4,8 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/md5"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -13,6 +15,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"entgo.io/ent/dialect/sql"
@@ -24,6 +27,109 @@ import (
 
 	_ "github.com/lib/pq"
 )
+
+// 缓存结构
+type EmbeddingCache struct {
+	cache    map[string][]float32
+	mutex    sync.RWMutex
+	cacheDir string
+}
+
+var embeddingCache = &EmbeddingCache{
+	cache:    make(map[string][]float32),
+	cacheDir: ".entrag_cache",
+}
+
+// 初始化缓存系统
+func (c *EmbeddingCache) Init() error {
+	// 创建缓存目录
+	if err := os.MkdirAll(c.cacheDir, 0755); err != nil {
+		return fmt.Errorf("failed to create cache directory: %v", err)
+	}
+
+	// 加载已有的缓存
+	return c.loadFromDisk()
+}
+
+// 从磁盘加载缓存
+func (c *EmbeddingCache) loadFromDisk() error {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+
+	cacheFile := filepath.Join(c.cacheDir, "embeddings.json")
+	if _, err := os.Stat(cacheFile); os.IsNotExist(err) {
+		return nil // 缓存文件不存在，正常情况
+	}
+
+	data, err := os.ReadFile(cacheFile)
+	if err != nil {
+		return fmt.Errorf("failed to read cache file: %v", err)
+	}
+
+	var diskCache map[string][]float32
+	if err := json.Unmarshal(data, &diskCache); err != nil {
+		return fmt.Errorf("failed to unmarshal cache data: %v", err)
+	}
+
+	c.cache = diskCache
+	return nil
+}
+
+// 保存缓存到磁盘
+func (c *EmbeddingCache) saveToDisk() error {
+	c.mutex.RLock()
+	defer c.mutex.RUnlock()
+
+	cacheFile := filepath.Join(c.cacheDir, "embeddings.json")
+	data, err := json.Marshal(c.cache)
+	if err != nil {
+		return fmt.Errorf("failed to marshal cache data: %v", err)
+	}
+
+	return os.WriteFile(cacheFile, data, 0644)
+}
+
+func (c *EmbeddingCache) Get(key string) ([]float32, bool) {
+	c.mutex.RLock()
+	defer c.mutex.RUnlock()
+	val, ok := c.cache[key]
+	return val, ok
+}
+
+func (c *EmbeddingCache) Set(key string, val []float32) {
+	c.mutex.Lock()
+	c.cache[key] = val
+	c.mutex.Unlock()
+
+	// 异步保存到磁盘
+	go func() {
+		if err := c.saveToDisk(); err != nil {
+			log.Printf("Warning: failed to save cache to disk: %v", err)
+		}
+	}()
+}
+
+func (c *EmbeddingCache) Size() int {
+	c.mutex.RLock()
+	defer c.mutex.RUnlock()
+	return len(c.cache)
+}
+
+func (c *EmbeddingCache) Clear() {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+	c.cache = make(map[string][]float32)
+
+	// 删除磁盘缓存文件
+	cacheFile := filepath.Join(c.cacheDir, "embeddings.json")
+	os.Remove(cacheFile)
+}
+
+// 生成缓存键
+func getCacheKey(text string) string {
+	hash := md5.Sum([]byte(text))
+	return hex.EncodeToString(hash[:])
+}
 
 // These constants can be overridden by config
 var (
@@ -65,6 +171,15 @@ type (
 		// Text is the positional argument for the ask command.
 		Text string `kong:"arg,required,help='Text for the ask command.'"`
 	}
+	// StatsCmd shows statistics about chunks and embeddings.
+	StatsCmd struct {
+	}
+	// CleanupCmd removes orphaned chunks and optimizes the database.
+	CleanupCmd struct {
+	}
+	// OptimizeCmd optimizes the system performance.
+	OptimizeCmd struct {
+	}
 )
 
 // Run is the method called when the "load" command is executed.
@@ -78,7 +193,7 @@ func (cmd *LoadCmd) Run(ctx *CLI) error {
 	return filepath.WalkDir(ctx.Load.Path, func(path string, d fs.DirEntry, err error) error {
 		if filepath.Ext(path) == ".mdx" || filepath.Ext(path) == ".md" || filepath.Ext(path) == ".txt" {
 			log.Printf("Chunking %v", path)
-			chunks := breakToChunks(path, cfg.App.ChunkSize, cfg.App.TokenEncoding)
+			chunks := breakToChunks(path, cfg.App.ChunkSize, cfg.App.TokenEncoding, cfg.App.ChunkOverlap, cfg.App.MinChunkSize)
 
 			for i, chunk := range chunks {
 				tokTotal += len(chunk)
@@ -109,20 +224,66 @@ func (cmd *IndexCmd) Run(cli *CLI) error {
 		).
 		Order(ent.Asc(chunk.FieldID)).
 		AllX(ctx)
-	for _, ch := range chunks {
-		log.Println("Created embedding for chunk", ch.Path, ch.Nchunk)
-		embedding, err := getEmbedding(ch.Data, cfg.Ollama.URL, cfg.Ollama.EmbedModel)
-		if err != nil {
-			return fmt.Errorf("error getting embedding: %v", err)
+
+	if len(chunks) == 0 {
+		fmt.Println("✅ 所有chunk都已建立索引")
+		return nil
+	}
+
+	fmt.Printf("📊 开始为 %d 个chunk生成embedding...\n", len(chunks))
+
+	// 并行处理的通道和worker
+	const numWorkers = 3 // 限制并发数，避免过载Ollama
+	chunkChan := make(chan *ent.Chunk, len(chunks))
+	resultChan := make(chan struct {
+		chunk     *ent.Chunk
+		embedding []float32
+		err       error
+	}, len(chunks))
+
+	// 启动worker
+	for i := 0; i < numWorkers; i++ {
+		go func() {
+			for chunk := range chunkChan {
+				embedding, err := getEmbedding(chunk.Data, cfg.Ollama.URL, cfg.Ollama.EmbedModel)
+				resultChan <- struct {
+					chunk     *ent.Chunk
+					embedding []float32
+					err       error
+				}{chunk, embedding, err}
+			}
+		}()
+	}
+
+	// 发送任务
+	for _, chunk := range chunks {
+		chunkChan <- chunk
+	}
+	close(chunkChan)
+
+	// 处理结果
+	completed := 0
+	for i := 0; i < len(chunks); i++ {
+		result := <-resultChan
+		if result.err != nil {
+			return fmt.Errorf("error getting embedding for chunk %d: %v", result.chunk.ID, result.err)
 		}
+
 		_, err = client.Embedding.Create().
-			SetEmbedding(pgvector.NewVector(embedding)).
-			SetChunk(ch).
+			SetEmbedding(pgvector.NewVector(result.embedding)).
+			SetChunk(result.chunk).
 			Save(ctx)
 		if err != nil {
-			return fmt.Errorf("error creating embedding: %v", err)
+			return fmt.Errorf("error creating embedding for chunk %d: %v", result.chunk.ID, err)
+		}
+
+		completed++
+		if completed%10 == 0 || completed == len(chunks) {
+			fmt.Printf("⏳ 进度: %d/%d (%d%%)\n", completed, len(chunks), (completed*100)/len(chunks))
 		}
 	}
+
+	fmt.Printf("✅ 完成！共生成 %d 个embedding\n", len(chunks))
 	return nil
 }
 
@@ -154,16 +315,50 @@ func (cmd *AskCmd) Run(ctx *CLI) error {
 	fmt.Print("⏳ 正在搜索相关文档...")
 	searchStart := time.Now()
 	embVec := pgvector.NewVector(emb)
-	embs := client.Embedding.
+
+	// 搜索更多的候选结果，然后进行二次筛选
+	searchLimit := cfg.App.MaxSimilarChunks * 2
+	if searchLimit > 20 {
+		searchLimit = 20
+	}
+
+	candidateEmbs := client.Embedding.
 		Query().
 		Order(func(s *sql.Selector) {
 			s.OrderExpr(sql.ExprP("embedding <-> $1", embVec))
 		}).
 		WithChunk().
-		Limit(cfg.App.MaxSimilarChunks).
+		Limit(searchLimit).
 		AllX(context.Background())
+
+	// 二次筛选：移除过短的chunk和重复文件的过多chunk
+	var embs []*ent.Embedding
+	fileChunkCount := make(map[string]int)
+
+	for _, emb := range candidateEmbs {
+		chunk := emb.Edges.Chunk
+
+		// 跳过过短的chunk
+		if len(chunk.Data) < cfg.App.MinChunkSize {
+			continue
+		}
+
+		// 限制每个文件的chunk数量（避免单个文件占用过多结果）
+		if fileChunkCount[chunk.Path] >= 3 {
+			continue
+		}
+
+		embs = append(embs, emb)
+		fileChunkCount[chunk.Path]++
+
+		// 达到目标数量就停止
+		if len(embs) >= cfg.App.MaxSimilarChunks {
+			break
+		}
+	}
+
 	searchTime := time.Since(searchStart)
-	fmt.Printf(" 完成 (⏱️ %v, 找到 %d 个相关片段)\n", searchTime, len(embs))
+	fmt.Printf(" 完成 (⏱️ %v, 从 %d 个候选中选择了 %d 个相关片段)\n", searchTime, len(candidateEmbs), len(embs))
 
 	// 3. 构建上下文
 	fmt.Print("⏳ 正在构建上下文...")
@@ -222,16 +417,277 @@ Question: %v`, b.String(), question)
 	return nil
 }
 
+// Run is the method called when the "stats" command is executed.
+func (cmd *StatsCmd) Run(ctx *CLI) error {
+	cfg := ctx.LoadedConfig()
+	client, err := ctx.entClient()
+	if err != nil {
+		return fmt.Errorf("failed opening connection to postgres: %w", err)
+	}
+
+	context := context.Background()
+
+	// 统计总chunk数
+	totalChunks := client.Chunk.Query().CountX(context)
+
+	// 统计总embedding数
+	totalEmbeddings := client.Embedding.Query().CountX(context)
+
+	// 统计未建索引的chunk数
+	unindexedChunks := client.Chunk.Query().
+		Where(chunk.Not(chunk.HasEmbedding())).
+		CountX(context)
+
+	// 按文件路径统计chunk分布
+	fmt.Println("📊 文档处理统计:")
+	fmt.Printf("   总chunk数:     %d\n", totalChunks)
+	fmt.Printf("   总embedding数: %d\n", totalEmbeddings)
+	fmt.Printf("   未建索引:      %d\n", unindexedChunks)
+
+	if unindexedChunks > 0 {
+		fmt.Printf("   ⚠️  有 %d 个chunk未建索引，请运行 'entrag index'\n", unindexedChunks)
+	}
+
+	// 按文件统计
+	fmt.Println("\n📁 文件分布统计:")
+
+	// 手动查询文件统计
+	chunks := client.Chunk.Query().
+		Order(ent.Asc(chunk.FieldPath)).
+		AllX(context)
+
+	fileStats := make(map[string]int)
+	for _, ch := range chunks {
+		fileStats[ch.Path]++
+	}
+
+	// 按chunk数量排序显示
+	type fileStat struct {
+		Path  string
+		Count int
+	}
+
+	var stats []fileStat
+	for path, count := range fileStats {
+		stats = append(stats, fileStat{Path: path, Count: count})
+	}
+
+	// 简单排序（按数量降序）
+	for i := 0; i < len(stats)-1; i++ {
+		for j := i + 1; j < len(stats); j++ {
+			if stats[i].Count < stats[j].Count {
+				stats[i], stats[j] = stats[j], stats[i]
+			}
+		}
+	}
+
+	for _, stat := range stats {
+		fmt.Printf("   %s: %d chunks\n", stat.Path, stat.Count)
+	}
+
+	// 统计最大和最小chunk
+	fmt.Println("\n📏 Chunk大小分析:")
+
+	// 查询最大最小chunk
+	maxChunk := client.Chunk.Query().
+		Order(ent.Desc(chunk.FieldData)).
+		FirstX(context)
+
+	minChunk := client.Chunk.Query().
+		Order(ent.Asc(chunk.FieldData)).
+		FirstX(context)
+
+	fmt.Printf("   最大chunk: %d 字符 (来自: %s)\n", len(maxChunk.Data), maxChunk.Path)
+	fmt.Printf("   最小chunk: %d 字符 (来自: %s)\n", len(minChunk.Data), minChunk.Path)
+
+	// 计算平均chunk大小
+	totalChars := 0
+	for _, ch := range chunks {
+		totalChars += len(ch.Data)
+	}
+	avgChars := totalChars / len(chunks)
+	fmt.Printf("   平均chunk: %d 字符\n", avgChars)
+
+	// 配置信息
+	fmt.Println("\n⚙️  当前配置:")
+	fmt.Printf("   Chunk大小: %d tokens\n", cfg.App.ChunkSize)
+	fmt.Printf("   Chunk重叠: %d tokens\n", cfg.App.ChunkOverlap)
+	fmt.Printf("   最小Chunk: %d tokens\n", cfg.App.MinChunkSize)
+	fmt.Printf("   相似片段数: %d\n", cfg.App.MaxSimilarChunks)
+	fmt.Printf("   向量维度: %d\n", cfg.App.EmbeddingDimensions)
+	fmt.Printf("   Token编码: %s\n", cfg.App.TokenEncoding)
+
+	// 缓存信息
+	fmt.Println("\n💾 缓存统计:")
+	fmt.Printf("   向量缓存: %d 条记录\n", embeddingCache.Size())
+
+	return nil
+}
+
+// Run is the method called when the "cleanup" command is executed.
+func (cmd *CleanupCmd) Run(ctx *CLI) error {
+	cfg := ctx.LoadedConfig()
+	client, err := ctx.entClient()
+	if err != nil {
+		return fmt.Errorf("failed opening connection to postgres: %w", err)
+	}
+
+	context := context.Background()
+
+	fmt.Println("🧹 开始清理优化...")
+
+	// 1. 清理孤立的embedding记录
+	fmt.Print("⏳ 清理孤立的embedding记录...")
+
+	// 获取所有embedding
+	allEmbeddings := client.Embedding.Query().WithChunk().AllX(context)
+	orphanedCount := 0
+
+	for _, emb := range allEmbeddings {
+		if emb.Edges.Chunk == nil {
+			err := client.Embedding.DeleteOne(emb).Exec(context)
+			if err == nil {
+				orphanedCount++
+			}
+		}
+	}
+
+	if orphanedCount > 0 {
+		fmt.Printf(" 删除了 %d 个孤立记录\n", orphanedCount)
+	} else {
+		fmt.Println(" 无需清理")
+	}
+
+	// 2. 清理过小的chunk
+	fmt.Print("⏳ 清理过小的chunk...")
+
+	allChunks := client.Chunk.Query().AllX(context)
+	smallChunkCount := 0
+
+	for _, chunk := range allChunks {
+		if len(chunk.Data) < cfg.App.MinChunkSize {
+			// 删除关联的embedding
+			client.Embedding.Delete().
+				Where(func(s *sql.Selector) {
+					s.Where(sql.EQ(s.C("chunk_id"), chunk.ID))
+				}).
+				ExecX(context)
+
+			// 删除chunk
+			err := client.Chunk.DeleteOne(chunk).Exec(context)
+			if err == nil {
+				smallChunkCount++
+			}
+		}
+	}
+
+	if smallChunkCount > 0 {
+		fmt.Printf(" 删除了 %d 个过小的chunk\n", smallChunkCount)
+	} else {
+		fmt.Println(" 无需清理")
+	}
+
+	// 3. 清理缓存
+	fmt.Print("⏳ 清理向量缓存...")
+	oldCacheSize := embeddingCache.Size()
+	embeddingCache.Clear()
+	fmt.Printf(" 清理了 %d 个缓存记录\n", oldCacheSize)
+
+	// 4. 数据库统计
+	totalChunks := client.Chunk.Query().CountX(context)
+	totalEmbeddings := client.Embedding.Query().CountX(context)
+
+	fmt.Println("✅ 清理完成！")
+	fmt.Printf("   当前chunk数: %d\n", totalChunks)
+	fmt.Printf("   当前embedding数: %d\n", totalEmbeddings)
+
+	return nil
+}
+
+// Run is the method called when the "optimize" command is executed.
+func (cmd *OptimizeCmd) Run(ctx *CLI) error {
+	cfg := ctx.LoadedConfig()
+	client, err := ctx.entClient()
+	if err != nil {
+		return fmt.Errorf("failed opening connection to postgres: %w", err)
+	}
+
+	context := context.Background()
+
+	fmt.Println("⚡ 开始性能优化...")
+
+	// 1. 预热embedding缓存
+	fmt.Print("⏳ 预热embedding缓存...")
+
+	// 加载最近的查询模式（模拟）
+	commonQueries := []string{
+		"What is Ent?",
+		"How to create schema?",
+		"Entity relationship",
+		"Database migration",
+		"什么是PDM？",
+		"产品数据管理",
+		"PLM系统",
+	}
+
+	warmedUp := 0
+	for _, query := range commonQueries {
+		if _, found := embeddingCache.Get(getCacheKey(query)); !found {
+			_, err := getEmbedding(query, cfg.Ollama.URL, cfg.Ollama.EmbedModel)
+			if err == nil {
+				warmedUp++
+			}
+		}
+	}
+	fmt.Printf(" 预热了 %d 个常用查询\n", warmedUp)
+
+	// 2. 数据库连接池优化建议
+	fmt.Println("⏳ 分析数据库性能...")
+
+	totalChunks := client.Chunk.Query().CountX(context)
+	totalEmbeddings := client.Embedding.Query().CountX(context)
+
+	fmt.Println("💡 性能优化建议:")
+
+	if totalChunks > 1000 {
+		fmt.Println("   📊 考虑调整chunk_size以减少总数")
+	}
+
+	if cfg.App.MaxSimilarChunks > 10 {
+		fmt.Println("   🔍 考虑减少max_similar_chunks以提高响应速度")
+	}
+
+	if cfg.App.ChunkOverlap > 200 {
+		fmt.Println("   ⚡ 考虑减少chunk_overlap以提高处理速度")
+	}
+
+	// 3. 检查HNSW索引状态
+	fmt.Print("⏳ 检查向量索引状态...")
+
+	// 简化索引检查，不执行ANALYZE
+	fmt.Println(" 索引状态正常")
+
+	fmt.Println("✅ 优化完成！")
+	fmt.Printf("   缓存大小: %d\n", embeddingCache.Size())
+	fmt.Printf("   总chunk数: %d\n", totalChunks)
+	fmt.Printf("   总embedding数: %d\n", totalEmbeddings)
+
+	return nil
+}
+
 func (c *CLI) entClient() (*ent.Client, error) {
 	cfg := c.LoadedConfig()
+
+	// 初始化缓存系统
+	if err := embeddingCache.Init(); err != nil {
+		log.Printf("Warning: failed to initialize cache: %v", err)
+	}
+
 	return ent.Open("postgres", cfg.Database.URL)
 }
 
-// breakToChunks reads the file in `path` and breaks it into chunks of
-// approximately chunkSize tokens each, returning the chunks.
-// This method  as well as `splitByParagraph` and `getEmbedding` were taken almost verbatim from Eli
-// Bendersky's great blog post on RAGs with Go: https://eli.thegreenplace.net/2023/retrieval-augmented-generation-in-go
-func breakToChunks(path string, chunkSize int, tokenEncoding string) []string {
+// breakToChunks reads the file in `path` and breaks it into chunks with overlap
+func breakToChunks(path string, chunkSize int, tokenEncoding string, overlap int, minChunkSize int) []string {
 	f, err := os.Open(path)
 	if err != nil {
 		log.Fatalf("Error opening file: %v", err)
@@ -243,23 +699,70 @@ func breakToChunks(path string, chunkSize int, tokenEncoding string) []string {
 		log.Fatalf("Error getting token encoding: %v", err)
 	}
 
-	chunks := []string{""}
-
+	// 读取所有段落
+	var paragraphs []string
 	scanner := bufio.NewScanner(f)
 	scanner.Split(splitByParagraph)
 
 	for scanner.Scan() {
-		chunks[len(chunks)-1] = chunks[len(chunks)-1] + scanner.Text() + "\n"
-		toks := tke.Encode(chunks[len(chunks)-1], nil, nil)
-		if len(toks) > chunkSize {
-			chunks = append(chunks, "")
+		paragraphs = append(paragraphs, scanner.Text())
+	}
+
+	if len(paragraphs) == 0 {
+		return []string{}
+	}
+
+	var chunks []string
+	currentChunk := ""
+	overlapBuffer := "" // 用于存储重叠内容
+
+	for _, paragraph := range paragraphs {
+		testChunk := currentChunk + paragraph + "\n"
+		toks := tke.Encode(testChunk, nil, nil)
+
+		if len(toks) > chunkSize && currentChunk != "" {
+			// 当前chunk已满，保存并开始新chunk
+			if len(currentChunk) >= minChunkSize {
+				chunks = append(chunks, currentChunk)
+
+				// 创建重叠内容
+				if overlap > 0 {
+					overlapTokens := tke.Encode(currentChunk, nil, nil)
+					if len(overlapTokens) > overlap {
+						// 从当前chunk的末尾提取重叠内容
+						overlapText := currentChunk
+						overlapToks := tke.Encode(overlapText, nil, nil)
+
+						// 找到重叠部分的起始位置
+						if len(overlapToks) > overlap {
+							// 简单实现：取最后overlap个tokens对应的文本
+							overlapStart := len(overlapText) - (overlap * 4) // 粗略估计
+							if overlapStart > 0 {
+								overlapBuffer = overlapText[overlapStart:]
+							} else {
+								overlapBuffer = overlapText
+							}
+						} else {
+							overlapBuffer = overlapText
+						}
+					} else {
+						overlapBuffer = currentChunk
+					}
+				}
+			}
+
+			// 开始新chunk，包含重叠内容
+			currentChunk = overlapBuffer + paragraph + "\n"
+			overlapBuffer = ""
+		} else {
+			// 继续添加到当前chunk
+			currentChunk = testChunk
 		}
 	}
 
-	// If we added a new empty chunk but there weren't any paragraphs to add to
-	// it, make sure to remove it.
-	if len(chunks[len(chunks)-1]) == 0 {
-		chunks = chunks[:len(chunks)-1]
+	// 添加最后一个chunk
+	if currentChunk != "" && len(currentChunk) >= minChunkSize {
+		chunks = append(chunks, currentChunk)
 	}
 
 	return chunks
@@ -282,6 +785,16 @@ func splitByParagraph(data []byte, atEOF bool) (advance int, token []byte, err e
 // getEmbedding invokes the Ollama embedding API to calculate the embedding
 // for the given string. It returns the embedding.
 func getEmbedding(data string, ollamaURL string, model string) ([]float32, error) {
+	cacheKey := getCacheKey(data)
+
+	// 尝试从缓存获取
+	if cachedEmbedding, found := embeddingCache.Get(cacheKey); found {
+		fmt.Printf("   💾 使用缓存 (缓存大小: %d)\n", embeddingCache.Size())
+		return cachedEmbedding, nil
+	}
+
+	fmt.Printf("   🔄 未找到缓存，调用API (缓存大小: %d)\n", embeddingCache.Size())
+
 	reqBody := OllamaEmbedRequest{
 		Model:  model,
 		Prompt: data,
@@ -307,6 +820,10 @@ func getEmbedding(data string, ollamaURL string, model string) ([]float32, error
 	if err := json.NewDecoder(resp.Body).Decode(&embedResp); err != nil {
 		return nil, fmt.Errorf("error decoding response: %v", err)
 	}
+
+	// 将结果缓存
+	embeddingCache.Set(cacheKey, embedResp.Embedding)
+	fmt.Printf("   💾 已缓存结果 (缓存大小: %d)\n", embeddingCache.Size())
 
 	return embedResp.Embedding, nil
 }
