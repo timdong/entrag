@@ -35,13 +35,37 @@ type EmbeddingCache struct {
 	cacheDir string
 }
 
+// 新增：问答缓存结构
+type QACache struct {
+	cache    map[string]string
+	mutex    sync.RWMutex
+	cacheDir string
+}
+
 var embeddingCache = &EmbeddingCache{
 	cache:    make(map[string][]float32),
 	cacheDir: ".entrag_cache",
 }
 
+// 新增：问答缓存实例
+var qaCache = &QACache{
+	cache:    make(map[string]string),
+	cacheDir: ".entrag_cache",
+}
+
 // 初始化缓存系统
 func (c *EmbeddingCache) Init() error {
+	// 创建缓存目录
+	if err := os.MkdirAll(c.cacheDir, 0755); err != nil {
+		return fmt.Errorf("failed to create cache directory: %v", err)
+	}
+
+	// 加载已有的缓存
+	return c.loadFromDisk()
+}
+
+// 新增：问答缓存初始化
+func (c *QACache) Init() error {
 	// 创建缓存目录
 	if err := os.MkdirAll(c.cacheDir, 0755); err != nil {
 		return fmt.Errorf("failed to create cache directory: %v", err)
@@ -75,6 +99,30 @@ func (c *EmbeddingCache) loadFromDisk() error {
 	return nil
 }
 
+// 新增：问答缓存从磁盘加载
+func (c *QACache) loadFromDisk() error {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+
+	cacheFile := filepath.Join(c.cacheDir, "qa_cache.json")
+	if _, err := os.Stat(cacheFile); os.IsNotExist(err) {
+		return nil // 缓存文件不存在，正常情况
+	}
+
+	data, err := os.ReadFile(cacheFile)
+	if err != nil {
+		return fmt.Errorf("failed to read QA cache file: %v", err)
+	}
+
+	var diskCache map[string]string
+	if err := json.Unmarshal(data, &diskCache); err != nil {
+		return fmt.Errorf("failed to unmarshal QA cache data: %v", err)
+	}
+
+	c.cache = diskCache
+	return nil
+}
+
 // 保存缓存到磁盘
 func (c *EmbeddingCache) saveToDisk() error {
 	c.mutex.RLock()
@@ -89,7 +137,29 @@ func (c *EmbeddingCache) saveToDisk() error {
 	return os.WriteFile(cacheFile, data, 0644)
 }
 
+// 新增：问答缓存保存到磁盘
+func (c *QACache) saveToDisk() error {
+	c.mutex.RLock()
+	defer c.mutex.RUnlock()
+
+	cacheFile := filepath.Join(c.cacheDir, "qa_cache.json")
+	data, err := json.Marshal(c.cache)
+	if err != nil {
+		return fmt.Errorf("failed to marshal QA cache data: %v", err)
+	}
+
+	return os.WriteFile(cacheFile, data, 0644)
+}
+
 func (c *EmbeddingCache) Get(key string) ([]float32, bool) {
+	c.mutex.RLock()
+	defer c.mutex.RUnlock()
+	val, ok := c.cache[key]
+	return val, ok
+}
+
+// 新增：问答缓存Get方法
+func (c *QACache) Get(key string) (string, bool) {
 	c.mutex.RLock()
 	defer c.mutex.RUnlock()
 	val, ok := c.cache[key]
@@ -109,7 +179,28 @@ func (c *EmbeddingCache) Set(key string, val []float32) {
 	}()
 }
 
+// 新增：问答缓存Set方法
+func (c *QACache) Set(key string, val string) {
+	c.mutex.Lock()
+	c.cache[key] = val
+	c.mutex.Unlock()
+
+	// 异步保存到磁盘
+	go func() {
+		if err := c.saveToDisk(); err != nil {
+			log.Printf("Warning: failed to save QA cache to disk: %v", err)
+		}
+	}()
+}
+
 func (c *EmbeddingCache) Size() int {
+	c.mutex.RLock()
+	defer c.mutex.RUnlock()
+	return len(c.cache)
+}
+
+// 新增：问答缓存Size方法
+func (c *QACache) Size() int {
 	c.mutex.RLock()
 	defer c.mutex.RUnlock()
 	return len(c.cache)
@@ -122,6 +213,17 @@ func (c *EmbeddingCache) Clear() {
 
 	// 删除磁盘缓存文件
 	cacheFile := filepath.Join(c.cacheDir, "embeddings.json")
+	os.Remove(cacheFile)
+}
+
+// 新增：问答缓存Clear方法
+func (c *QACache) Clear() {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+	c.cache = make(map[string]string)
+
+	// 删除磁盘缓存文件
+	cacheFile := filepath.Join(c.cacheDir, "qa_cache.json")
 	os.Remove(cacheFile)
 }
 
@@ -520,6 +622,7 @@ func (cmd *StatsCmd) Run(ctx *CLI) error {
 	// 缓存信息
 	fmt.Println("\n💾 缓存统计:")
 	fmt.Printf("   向量缓存: %d 条记录\n", embeddingCache.Size())
+	fmt.Printf("   问答缓存: %d 条记录\n", qaCache.Size())
 
 	return nil
 }
@@ -588,10 +691,12 @@ func (cmd *CleanupCmd) Run(ctx *CLI) error {
 	}
 
 	// 3. 清理缓存
-	fmt.Print("⏳ 清理向量缓存...")
-	oldCacheSize := embeddingCache.Size()
+	fmt.Print("⏳ 清理缓存...")
+	oldEmbeddingCacheSize := embeddingCache.Size()
+	oldQACacheSize := qaCache.Size()
 	embeddingCache.Clear()
-	fmt.Printf(" 清理了 %d 个缓存记录\n", oldCacheSize)
+	qaCache.Clear()
+	fmt.Printf(" 清理了 %d 个向量缓存记录, %d 个问答缓存记录\n", oldEmbeddingCacheSize, oldQACacheSize)
 
 	// 4. 数据库统计
 	totalChunks := client.Chunk.Query().CountX(context)
@@ -668,7 +773,8 @@ func (cmd *OptimizeCmd) Run(ctx *CLI) error {
 	fmt.Println(" 索引状态正常")
 
 	fmt.Println("✅ 优化完成！")
-	fmt.Printf("   缓存大小: %d\n", embeddingCache.Size())
+	fmt.Printf("   向量缓存大小: %d\n", embeddingCache.Size())
+	fmt.Printf("   问答缓存大小: %d\n", qaCache.Size())
 	fmt.Printf("   总chunk数: %d\n", totalChunks)
 	fmt.Printf("   总embedding数: %d\n", totalEmbeddings)
 
@@ -678,9 +784,14 @@ func (cmd *OptimizeCmd) Run(ctx *CLI) error {
 func (c *CLI) entClient() (*ent.Client, error) {
 	cfg := c.LoadedConfig()
 
-	// 初始化缓存系统
+	// 初始化向量缓存系统
 	if err := embeddingCache.Init(); err != nil {
-		log.Printf("Warning: failed to initialize cache: %v", err)
+		log.Printf("Warning: failed to initialize embedding cache: %v", err)
+	}
+
+	// 初始化问答缓存系统
+	if err := qaCache.Init(); err != nil {
+		log.Printf("Warning: failed to initialize QA cache: %v", err)
 	}
 
 	return ent.Open("postgres", cfg.Database.URL)
@@ -830,8 +941,21 @@ func getEmbedding(data string, ollamaURL string, model string) ([]float32, error
 
 // getChatCompletion invokes the Ollama chat API to generate a response
 func getChatCompletion(prompt string, ollamaURL string, model string) (string, error) {
+	// 生成缓存键
+	cacheKey := getCacheKey(prompt)
+
+	// 尝试从缓存获取
+	if cachedAnswer, found := qaCache.Get(cacheKey); found {
+		fmt.Printf("   💾 使用问答缓存 (问答缓存大小: %d)\n", qaCache.Size())
+		fmt.Printf("   📝 上下文长度: %d 字符\n", len(prompt))
+		fmt.Printf("   🤖 使用模型: %s\n", model)
+		fmt.Printf("   📊 响应长度: %d 字符\n", len(cachedAnswer))
+		return cachedAnswer, nil
+	}
+
 	// 记录请求的详细信息
 	promptLen := len(prompt)
+	fmt.Printf("   🔄 未找到问答缓存，调用LLM API (问答缓存大小: %d)\n", qaCache.Size())
 	fmt.Printf("   📝 上下文长度: %d 字符\n", promptLen)
 	fmt.Printf("   🤖 使用模型: %s\n", model)
 
@@ -872,6 +996,10 @@ func getChatCompletion(prompt string, ollamaURL string, model string) (string, e
 	fmt.Printf("   📊 网络请求时间: %v\n", networkTime)
 	fmt.Printf("   📊 响应解析时间: %v\n", parseTime)
 	fmt.Printf("   📊 响应长度: %d 字符\n", len(chatResp.Response))
+
+	// 将结果缓存
+	qaCache.Set(cacheKey, chatResp.Response)
+	fmt.Printf("   💾 已缓存问答结果 (问答缓存大小: %d)\n", qaCache.Size())
 
 	return chatResp.Response, nil
 }
