@@ -413,54 +413,12 @@ func (cmd *AskCmd) Run(ctx *CLI) error {
 	embeddingTime := time.Since(embeddingStart)
 	fmt.Printf(" 完成 (⏱️ %v)\n", embeddingTime)
 
-	// 2. 向量搜索相似文档
+	// 2. 智能检索相似文档
 	fmt.Print("⏳ 正在搜索相关文档...")
 	searchStart := time.Now()
-	embVec := pgvector.NewVector(emb)
-
-	// 搜索更多的候选结果，然后进行二次筛选
-	searchLimit := cfg.App.MaxSimilarChunks * 2
-	if searchLimit > 20 {
-		searchLimit = 20
-	}
-
-	candidateEmbs := client.Embedding.
-		Query().
-		Order(func(s *sql.Selector) {
-			s.OrderExpr(sql.ExprP("embedding <-> $1", embVec))
-		}).
-		WithChunk().
-		Limit(searchLimit).
-		AllX(context.Background())
-
-	// 二次筛选：移除过短的chunk和重复文件的过多chunk
-	var embs []*ent.Embedding
-	fileChunkCount := make(map[string]int)
-
-	for _, emb := range candidateEmbs {
-		chunk := emb.Edges.Chunk
-
-		// 跳过过短的chunk
-		if len(chunk.Data) < cfg.App.MinChunkSize {
-			continue
-		}
-
-		// 限制每个文件的chunk数量（避免单个文件占用过多结果）
-		if fileChunkCount[chunk.Path] >= 3 {
-			continue
-		}
-
-		embs = append(embs, emb)
-		fileChunkCount[chunk.Path]++
-
-		// 达到目标数量就停止
-		if len(embs) >= cfg.App.MaxSimilarChunks {
-			break
-		}
-	}
-
+	embs, searchDetails := performIntelligentSearch(client, emb, question, cfg)
 	searchTime := time.Since(searchStart)
-	fmt.Printf(" 完成 (⏱️ %v, 从 %d 个候选中选择了 %d 个相关片段)\n", searchTime, len(candidateEmbs), len(embs))
+	fmt.Printf(" 完成 (⏱️ %v, %s)\n", searchTime, searchDetails)
 
 	// 3. 构建上下文
 	fmt.Print("⏳ 正在构建上下文...")
@@ -470,12 +428,11 @@ func (cmd *AskCmd) Run(ctx *CLI) error {
 		chnk := e.Edges.Chunk
 		b.WriteString(fmt.Sprintf("From file: %v\n", chnk.Path))
 		b.WriteString(chnk.Data)
+		b.WriteString("\n---\n")
 	}
-	query := fmt.Sprintf(`Use the below information from the ent docs to answer the subsequent question.
-Information:
-%v
 
-Question: %v`, b.String(), question)
+	// 优化后的prompt模板
+	query := buildOptimizedPrompt(question, b.String())
 	contextTime := time.Since(contextStart)
 	fmt.Printf(" 完成 (⏱️ %v)\n", contextTime)
 
@@ -517,6 +474,273 @@ Question: %v`, b.String(), question)
 	fmt.Print(out)
 
 	return nil
+}
+
+// 智能检索函数
+func performIntelligentSearch(client *ent.Client, emb []float32, question string, cfg *Config) ([]*ent.Embedding, string) {
+	embVec := pgvector.NewVector(emb)
+
+	// 1. 扩大搜索范围，获取更多候选
+	searchLimit := cfg.App.MaxSimilarChunks * 3
+	if searchLimit > 30 {
+		searchLimit = 30
+	}
+
+	candidateEmbs := client.Embedding.
+		Query().
+		Order(func(s *sql.Selector) {
+			s.OrderExpr(sql.ExprP("embedding <-> $1", embVec))
+		}).
+		WithChunk().
+		Limit(searchLimit).
+		AllX(context.Background())
+
+	// 2. 查询类型分析
+	queryType := classifyQuery(question)
+
+	// 3. 智能过滤和重排序
+	filteredEmbs := intelligentFilter(candidateEmbs, question, queryType, cfg)
+
+	// 4. 多样性优化
+	finalEmbs := optimizeForDiversity(filteredEmbs, cfg.App.MaxSimilarChunks)
+
+	details := fmt.Sprintf("从 %d 个候选中智能选择了 %d 个高质量片段 (查询类型: %s)",
+		len(candidateEmbs), len(finalEmbs), queryType)
+
+	return finalEmbs, details
+}
+
+// 查询类型分类
+func classifyQuery(question string) string {
+	question = strings.ToLower(question)
+
+	// 概念性问题
+	if strings.Contains(question, "what is") || strings.Contains(question, "什么是") ||
+		strings.Contains(question, "定义") || strings.Contains(question, "概念") {
+		return "概念性"
+	}
+
+	// 操作性问题
+	if strings.Contains(question, "how to") || strings.Contains(question, "如何") ||
+		strings.Contains(question, "怎样") || strings.Contains(question, "方法") {
+		return "操作性"
+	}
+
+	// 比较性问题
+	if strings.Contains(question, "difference") || strings.Contains(question, "区别") ||
+		strings.Contains(question, "比较") || strings.Contains(question, "对比") {
+		return "比较性"
+	}
+
+	// 列举性问题
+	if strings.Contains(question, "列举") || strings.Contains(question, "有哪些") ||
+		strings.Contains(question, "特点") || strings.Contains(question, "优点") {
+		return "列举性"
+	}
+
+	return "通用"
+}
+
+// 智能过滤函数
+func intelligentFilter(candidateEmbs []*ent.Embedding, question string, queryType string, cfg *Config) []*ent.Embedding {
+	var filtered []*ent.Embedding
+	fileChunkCount := make(map[string]int)
+	questionWords := strings.Fields(strings.ToLower(question))
+
+	for _, emb := range candidateEmbs {
+		chunk := emb.Edges.Chunk
+
+		// 1. 基本过滤：长度检查
+		if len(chunk.Data) < cfg.App.MinChunkSize {
+			continue
+		}
+
+		// 2. 文件多样性控制（放宽限制）
+		maxPerFile := 4
+		if queryType == "概念性" {
+			maxPerFile = 3 // 概念性问题需要更多样化的来源
+		} else if queryType == "操作性" {
+			maxPerFile = 5 // 操作性问题可能需要更多细节
+		}
+
+		if fileChunkCount[chunk.Path] >= maxPerFile {
+			continue
+		}
+
+		// 3. 关键词匹配度检查（更宽松）
+		chunkText := strings.ToLower(chunk.Data)
+		keywordMatches := 0
+		for _, word := range questionWords {
+			if len(word) > 2 && strings.Contains(chunkText, word) {
+				keywordMatches++
+			}
+		}
+
+		// 4. 根据查询类型调整过滤标准（降低门槛）
+		shouldInclude := false
+		switch queryType {
+		case "概念性":
+			// 概念性问题：降低要求，只要有部分匹配就包含
+			shouldInclude = keywordMatches >= 1 ||
+				strings.Contains(chunkText, "定义") ||
+				strings.Contains(chunkText, "是") ||
+				strings.Contains(chunkText, "describes") ||
+				strings.Contains(chunkText, "definition") ||
+				strings.Contains(chunkText, "ent") || // 放宽：包含核心关键词
+				strings.Contains(chunkText, "orm")
+		case "操作性":
+			// 操作性问题：包含方法相关内容
+			shouldInclude = keywordMatches >= 1 ||
+				strings.Contains(chunkText, "步骤") ||
+				strings.Contains(chunkText, "方法") ||
+				strings.Contains(chunkText, "how") ||
+				strings.Contains(chunkText, "step") ||
+				strings.Contains(chunkText, "func") || // 放宽：包含代码相关
+				strings.Contains(chunkText, "function")
+		case "比较性":
+			// 比较性问题：包含比较相关内容
+			shouldInclude = keywordMatches >= 1 ||
+				strings.Contains(chunkText, "vs") ||
+				strings.Contains(chunkText, "compared") ||
+				strings.Contains(chunkText, "difference") ||
+				strings.Contains(chunkText, "pdm") || // 放宽：包含具体术语
+				strings.Contains(chunkText, "plm")
+		case "列举性":
+			// 列举性问题：包含特点、优点等内容
+			shouldInclude = keywordMatches >= 1 ||
+				strings.Contains(chunkText, "特点") ||
+				strings.Contains(chunkText, "优点") ||
+				strings.Contains(chunkText, "advantages") ||
+				strings.Contains(chunkText, "features") ||
+				strings.Contains(chunkText, "ent") || // 放宽：包含核心关键词
+				strings.Contains(chunkText, "orm")
+		default:
+			// 通用查询：只要有任何关键词匹配就包含
+			shouldInclude = keywordMatches >= 1 || len(questionWords) == 0
+		}
+
+		// 5. 兜底策略：如果过滤太严格，降低标准
+		if !shouldInclude && len(filtered) < cfg.App.MaxSimilarChunks/2 {
+			// 如果当前结果太少，进一步放宽条件
+			for _, word := range questionWords {
+				if len(word) > 1 && strings.Contains(chunkText, word) {
+					shouldInclude = true
+					break
+				}
+			}
+		}
+
+		if shouldInclude {
+			filtered = append(filtered, emb)
+			fileChunkCount[chunk.Path]++
+		}
+	}
+
+	// 6. 最终兜底：如果还是没有结果，选择前几个相似度最高的
+	if len(filtered) == 0 && len(candidateEmbs) > 0 {
+		maxFallback := cfg.App.MaxSimilarChunks
+		if maxFallback > len(candidateEmbs) {
+			maxFallback = len(candidateEmbs)
+		}
+		for i := 0; i < maxFallback; i++ {
+			chunk := candidateEmbs[i].Edges.Chunk
+			if len(chunk.Data) >= cfg.App.MinChunkSize {
+				filtered = append(filtered, candidateEmbs[i])
+			}
+		}
+	}
+
+	return filtered
+}
+
+// 多样性优化函数
+func optimizeForDiversity(embs []*ent.Embedding, maxResults int) []*ent.Embedding {
+	if len(embs) <= maxResults {
+		return embs
+	}
+
+	// 按文件路径分组
+	fileGroups := make(map[string][]*ent.Embedding)
+	for _, emb := range embs {
+		path := emb.Edges.Chunk.Path
+		fileGroups[path] = append(fileGroups[path], emb)
+	}
+
+	// 优化选择策略：尽量从不同文件选择
+	var result []*ent.Embedding
+	fileIndex := make(map[string]int)
+
+	for len(result) < maxResults && len(result) < len(embs) {
+		added := false
+
+		// 轮询各个文件，每轮最多从每个文件选择1个
+		for path, group := range fileGroups {
+			if len(result) >= maxResults {
+				break
+			}
+
+			idx := fileIndex[path]
+			if idx < len(group) {
+				result = append(result, group[idx])
+				fileIndex[path]++
+				added = true
+			}
+		}
+
+		if !added {
+			break
+		}
+	}
+
+	return result
+}
+
+// 优化后的prompt构建
+func buildOptimizedPrompt(question string, context string) string {
+	// 根据问题类型构建更好的prompt
+	queryType := classifyQuery(question)
+
+	var promptTemplate string
+	switch queryType {
+	case "概念性":
+		promptTemplate = `基于以下技术文档，请准确回答关于概念的问题。请提供清晰的定义和解释。
+
+技术文档:
+%s
+
+问题: %s
+
+请提供准确、简洁的回答，重点解释概念的含义和特点。`
+	case "操作性":
+		promptTemplate = `基于以下技术文档，请详细回答关于操作方法的问题。请提供具体的步骤和示例。
+
+技术文档:
+%s
+
+问题: %s
+
+请提供详细的操作步骤，包括必要的代码示例和注意事项。`
+	case "比较性":
+		promptTemplate = `基于以下技术文档，请详细比较和分析。请突出不同点和相似点。
+
+技术文档:
+%s
+
+问题: %s
+
+请提供详细的比较分析，突出关键差异和各自的优缺点。`
+	default:
+		promptTemplate = `基于以下技术文档，请准确回答问题。
+
+技术文档:
+%s
+
+问题: %s
+
+请基于文档内容提供准确、详细的回答。`
+	}
+
+	return fmt.Sprintf(promptTemplate, context, question)
 }
 
 // Run is the method called when the "stats" command is executed.

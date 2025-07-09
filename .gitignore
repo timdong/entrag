@@ -96,3 +96,6 @@ config.prod.yaml
 # Docker volumes
 docker-data/
 postgres-data/ 
+
+# Data directory    
+data/elead/
